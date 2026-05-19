@@ -1,0 +1,3 @@
+# User-authored skills land here.  The merge-back step copies the contents
+# of this directory (and only this directory under skills/) back to the
+# template at the end of each run.

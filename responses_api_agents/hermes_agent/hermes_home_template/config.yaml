@@ -1,0 +1,32 @@
+# Hermes Agent config template for NeMo-Skills multi-agent runs.
+#
+# This file is the BASELINE for every per-agent HERMES_HOME the pipeline
+# materializes at job start.  The pipeline overlays agent-specific fields
+# (provider/model URL, mcp_servers entries, terminal backend) after copying
+# this template.  Keep this file minimal — anything model- or provider-
+# specific belongs in the overlay, not here, so the template stays portable
+# across cluster/profile combinations.
+
+# Model providers are configured at runtime by the pipeline; leave empty here.
+model: null
+providers: {}
+
+# Persistent memory and skills are managed by the curator / merge-back step.
+# Defaults below match the merge-back policy: ``MEMORY.md``, ``USER.md``,
+# and ``skills/user/`` survive across runs; everything else is per-run.
+memory:
+  enabled: true
+  user_profile_enabled: false
+
+skills:
+  creation_nudge_interval: 10
+
+# MCP servers are injected by the pipeline overlay (one stanza per NS-MCP
+# tool the agent should see).  Keep this map empty in the template so a
+# stale entry doesn't shadow what the pipeline wires up.
+mcp_servers: {}
+
+# Delegation defaults; the orchestrator may override via overlay.
+delegation:
+  max_spawn_depth: 1
+  subagent_auto_approve: false

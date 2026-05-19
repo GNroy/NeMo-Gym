@@ -19,12 +19,12 @@ import os
 import sys
 from asyncio import Semaphore
 from time import time
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 import model_tools  # noqa: F401  # fail-fast if hermes-agent isn't installed
-from fastapi import Request
-from pydantic import ConfigDict
+from fastapi import FastAPI, Request
+from pydantic import BaseModel, ConfigDict
 
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
 from nemo_gym.base_responses_api_agent import (
@@ -159,6 +159,28 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     terminal_backend: str = "local"
     terminal_timeout: int = 60
     system_prompt: Optional[str] = None
+    # --- Phase 0 additions --------------------------------------------------
+    # Each agent's HERMES_HOME (per-run snapshot of memory/skills/sessions).
+    # When set, ``model_post_init`` exports it via both env var (for hermes
+    # subprocesses) and the ContextVar override (for in-process callers).
+    # Defaults to ``None`` so existing benchmarks keep the historic
+    # ``~/.hermes`` fallback behavior.
+    hermes_home: Optional[str] = None
+    # Persistence flags forwarded to ``AIAgent``.  Defaults preserve the
+    # original benchmark behavior (everything off — sessions are stateless).
+    # The new pipeline turns these on when ``hermes_home`` points at a
+    # job-local snapshot.
+    persist_memory: bool = False
+    persist_skills: bool = False
+    persist_session: bool = False
+    save_trajectories: bool = False
+    enable_compression: bool = False
+    # JSONL trace sink.  When set, ``trace_writer.build_callbacks`` is wired
+    # into ``AIAgent`` for every conversation; events land in
+    # ``<trace_dir>/<session_id>.jsonl``.  ``agent_name`` defaults to
+    # ``config.name`` so multi-agent fleets get distinct trace identities.
+    trace_dir: Optional[str] = None
+    agent_name: Optional[str] = None
 
 
 class HermesAgentRunRequest(BaseRunRequest):
@@ -169,6 +191,56 @@ class HermesAgentVerifyResponse(BaseVerifyResponse):
     model_config = ConfigDict(extra="allow")
     turns_used: int = 0
     finished_naturally: bool = False
+
+
+class _TaskMessage(BaseModel):
+    role: str
+    content: str
+
+
+class TaskRequest(BaseModel):
+    """Payload accepted by the ``/task`` adapter endpoint.
+
+    Matches ``nemo_skills.mcp.servers.agent_tool.CallAgentTool._http_call``:
+    ``{"task_id": str, "messages": [{"role": "user", "content": str}, ...]}``.
+    The worker runs one conversation and returns the last assistant text.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    task_id: Optional[str] = None
+    messages: List[_TaskMessage]
+
+
+class TaskResponse(BaseModel):
+    """Reply shape consumed by ``CallAgentTool``.
+
+    ``generation`` is the worker's final assistant text (may be empty).
+    ``error`` is non-empty only on failure; ``CallAgentTool`` propagates
+    it to the orchestrator as a tool error.
+    """
+
+    generation: str = ""
+    error: str = ""
+
+
+def _extract_last_assistant_text(resp: "NeMoGymResponse") -> str:
+    """Return the text of the last assistant message in a NeMoGymResponse.
+
+    Walks the response's output items in order; the last assistant
+    ``output_text`` content wins.  Returns empty string if no assistant
+    message was emitted (matches ``HermesAgent.responses`` padding behavior).
+    """
+    last = ""
+    for item in resp.output or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        if getattr(item, "role", None) != "assistant":
+            continue
+        for chunk in getattr(item, "content", None) or []:
+            text = getattr(chunk, "text", None)
+            if text:
+                last = text
+    return last
 
 
 class HermesAgent(SimpleResponsesAPIAgent):
@@ -183,6 +255,22 @@ class HermesAgent(SimpleResponsesAPIAgent):
         os.environ["TERMINAL_ENV"] = self.config.terminal_backend
         os.environ["TERMINAL_TIMEOUT"] = str(self.config.terminal_timeout)
 
+        # HERMES_HOME isolation.  Setting the env var covers any hermes-agent
+        # subprocess (terminal backends, MCP stdio servers, cron workers).
+        # The ContextVar override additionally scopes get_hermes_home() within
+        # this process — defense in depth so a future multi-agent-in-one-process
+        # mode doesn't silently collide on the global env.
+        if self.config.hermes_home:
+            os.environ["HERMES_HOME"] = self.config.hermes_home
+            try:
+                from hermes_constants import set_hermes_home_override
+
+                set_hermes_home_override(self.config.hermes_home)
+            except ImportError:
+                # hermes-agent not on path (e.g. unit tests using only this
+                # module's helpers) — the env var still routes subprocesses.
+                LOG.debug("hermes_constants not importable; relying on HERMES_HOME env var only")
+
     def _resolve_model_base_url(self) -> str:
         # aiagent builds its own openai client; resolve policy_model url
         model_server_cfg = get_first_server_config_dict(
@@ -191,6 +279,38 @@ class HermesAgent(SimpleResponsesAPIAgent):
         )
         base = self.server_client._build_server_base_url(model_server_cfg)
         return f"{base}/v1"
+
+    def setup_webserver(self) -> FastAPI:
+        """Extend the base server with a ``/task`` adapter for CallAgentTool.
+
+        ``CallAgentTool._http_call`` (nemo_skills.mcp.servers.agent_tool) POSTs
+        ``{"task_id", "messages": [{"role": "user", "content": ...}]}`` to
+        ``{url}/task`` and expects ``{"generation": ..., "error": ...}``.
+        We translate that to the existing ``responses()`` flow and extract the
+        last assistant text — no resources_server seed/verify happens here;
+        the worker is a peer agent, not a self-contained rollout.
+        """
+        app = super().setup_webserver()
+        app.post("/task")(self.task)
+        return app
+
+    def _resolve_session_id(self, request: Request) -> str:
+        """Pick a deterministic session_id for trace files.
+
+        Order of precedence:
+          1. ``request.state.task_id`` (set by ``/task`` from ``CallAgentTool``)
+          2. Freshly minted UUID — guarantees a unique trace file per call.
+
+        The ``isinstance(..., str)`` check is deliberate: ``MagicMock``-backed
+        ``Request`` objects in unit tests resolve every attribute to a
+        ``MagicMock``, which would otherwise pass a naive truthy check and
+        emit unreadable trace filenames.
+        """
+        state = getattr(request, "state", None)
+        task_id = getattr(state, "task_id", None) if state is not None else None
+        if isinstance(task_id, str) and task_id:
+            return task_id
+        return f"sess_{uuid4().hex}"
 
     async def responses(
         self,
@@ -209,6 +329,36 @@ class HermesAgent(SimpleResponsesAPIAgent):
         base_url = self._resolve_model_base_url()
         model_name = str(self.config.model_server.name)
 
+        session_id = self._resolve_session_id(request)
+        agent_name = self.config.agent_name or self.config.name or "hermes_agent"
+
+        # Wire up optional JSONL trace callbacks before constructing AIAgent.
+        # Importing lazily so a missing trace_dir keeps this module importable
+        # in environments that don't ship the trace_writer (unit tests of the
+        # helper functions, schema validators, etc.).
+        agent_kwargs: Dict[str, Any] = {}
+        if self.config.trace_dir:
+            from responses_api_agents.hermes_agent.trace_writer import (
+                build_callbacks,
+                emit_event,
+            )
+
+            agent_kwargs.update(build_callbacks(self.config.trace_dir, agent_name, session_id))
+            emit_event(
+                self.config.trace_dir,
+                agent_name,
+                session_id,
+                "session_start",
+                {
+                    "model": model_name,
+                    "max_turns": self.config.max_turns,
+                    "history_len": len(history),
+                    "user_message_preview": (user_message or "")[:200],
+                },
+            )
+        else:
+            emit_event = None  # type: ignore[assignment]
+
         agent = AIAgent(
             base_url=base_url,
             api_key="gym",  # pragma: allowlist secret
@@ -220,12 +370,18 @@ class HermesAgent(SimpleResponsesAPIAgent):
             enabled_toolsets=self.config.enabled_toolsets,
             disabled_toolsets=self.config.disabled_toolsets,
             quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-            persist_session=False,
-            save_trajectories=False,
+            # Persistence flags — defaults preserve original benchmark
+            # behavior; the new pipeline turns these on per agent.
+            skip_context_files=not self.config.persist_memory,
+            skip_memory=not self.config.persist_memory,
+            persist_session=self.config.persist_session,
+            save_trajectories=self.config.save_trajectories,
+            session_id=session_id,
+            **agent_kwargs,
         )
-        agent.compression_enabled = False
+        # Context compression mutates trajectories non-monotonically; keep it
+        # off unless explicitly enabled — RL training needs faithful traces.
+        agent.compression_enabled = self.config.enable_compression
 
         _original_build_api_kwargs = agent._build_api_kwargs
 
@@ -238,12 +394,22 @@ class HermesAgent(SimpleResponsesAPIAgent):
 
         agent._build_api_kwargs = _patched_build_api_kwargs
 
-        result = await asyncio.to_thread(
-            agent.run_conversation,
-            user_message,
-            system_message,
-            history,
-        )
+        try:
+            result = await asyncio.to_thread(
+                agent.run_conversation,
+                user_message,
+                system_message,
+                history,
+            )
+        finally:
+            if emit_event is not None:
+                emit_event(
+                    self.config.trace_dir,
+                    agent_name,
+                    session_id,
+                    "session_end",
+                    {},
+                )
 
         messages = result.get("messages") or []
         # aiagent omits system from returned messages
@@ -346,6 +512,34 @@ class HermesAgent(SimpleResponsesAPIAgent):
             return HermesAgentVerifyResponse.model_validate(
                 verify_json | {"turns_used": turns, "finished_naturally": naturally}
             )
+
+    async def task(self, request: Request, body: TaskRequest) -> TaskResponse:
+        """Peer-to-peer agent endpoint consumed by ``CallAgentTool``.
+
+        Translates a ``{task_id, messages}`` payload into the existing
+        ``responses`` flow.  Does **not** call the resources_server — workers
+        are peer agents whose verification is owned by the orchestrator.
+        Any exception during the underlying conversation is converted into a
+        non-empty ``error`` field so the caller's tool layer can recover.
+        """
+        if body.task_id:
+            # Stash on request.state so ``responses`` can use it as session_id
+            # (trace files key by session, so the same task across agents
+            # remains joinable).
+            request.state.task_id = body.task_id
+
+        create_params = NeMoGymResponseCreateParamsNonStreaming(
+            input=[NeMoGymEasyInputMessage(role=m.role, content=m.content) for m in body.messages],
+        )
+
+        async with self.sem:
+            try:
+                resp = await self.responses(request, create_params)
+            except Exception as exc:  # noqa: BLE001 - surface any failure to caller
+                LOG.exception("HermesAgent.task failed: %s", exc)
+                return TaskResponse(generation="", error=f"{type(exc).__name__}: {exc}")
+
+        return TaskResponse(generation=_extract_last_assistant_text(resp), error="")
 
 
 if __name__ == "__main__":
