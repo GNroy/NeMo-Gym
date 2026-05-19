@@ -14,10 +14,12 @@
 # limitations under the License.
 
 import asyncio
+import json
 import logging
 import os
 import sys
 from asyncio import Semaphore
+from pathlib import Path
 from time import time
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
@@ -181,6 +183,15 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     # ``config.name`` so multi-agent fleets get distinct trace identities.
     trace_dir: Optional[str] = None
     agent_name: Optional[str] = None
+    # --- Phase 0.5 additions ------------------------------------------------
+    # Peer-agent map (orchestrator-facing).  Keys are logical agent names,
+    # values are ``{het_group: int, port: int}`` entries.  At runtime, the
+    # bundled ``peer_agents`` Hermes plugin (see
+    # ``hermes_home_template/plugins/peer_agents/``) registers one
+    # ``call_<name>`` tool per entry; URLs are resolved lazily from
+    # ``SLURM_MASTER_NODE_HET_GROUP_N`` env vars so the same overlay JSON
+    # works regardless of which node SLURM picks for each het-group.
+    peer_agents: Optional[Dict[str, Dict[str, Any]]] = None
 
 
 class HermesAgentRunRequest(BaseRunRequest):
@@ -270,6 +281,46 @@ class HermesAgent(SimpleResponsesAPIAgent):
                 # hermes-agent not on path (e.g. unit tests using only this
                 # module's helpers) — the env var still routes subprocesses.
                 LOG.debug("hermes_constants not importable; relying on HERMES_HOME env var only")
+
+            # Phase 0.5: merge the pipeline-written overlay JSON.
+            # The ns hermes_agent_rollouts pipeline writes
+            # ``<hermes_home>/hermes_agent_overlay.json`` from its manifest —
+            # carrying agent_name, trace_dir, persistence flags, and the
+            # orchestrator's peer_agents map.  We apply it as field-level
+            # overrides on top of the YAML config so Hydra config_paths and
+            # the manifest can coexist without one having to mirror the other.
+            self._apply_overlay_file(Path(self.config.hermes_home) / "hermes_agent_overlay.json")
+
+    def _apply_overlay_file(self, overlay_path: "Path") -> None:
+        """Merge JSON overlay fields into ``self.config``.
+
+        No-op if the file does not exist (the field was set via the existing
+        Hydra path, or no overlay is in use).  Unknown keys are ignored with
+        a warning to keep the contract additive — adding a new overlay key
+        from the pipeline never breaks an older agent build.
+        """
+        if not overlay_path.is_file():
+            return
+        try:
+            data = json.loads(overlay_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            LOG.warning("hermes_agent: failed to read overlay %s: %s", overlay_path, exc)
+            return
+        if not isinstance(data, dict):
+            LOG.warning("hermes_agent: overlay %s is not a JSON object; ignoring", overlay_path)
+            return
+
+        known = set(HermesAgentConfig.model_fields)
+        for key, value in data.items():
+            if key not in known:
+                LOG.warning("hermes_agent: overlay key %r is not a known field; ignoring", key)
+                continue
+            # Pydantic v2 models forbid attribute assignment unless
+            # ``validate_assignment`` is set; bypass via object.__setattr__ —
+            # safe because the overlay only writes recognised fields and the
+            # values are forwarded verbatim to AIAgent / trace_writer downstream.
+            object.__setattr__(self.config, key, value)
+            LOG.debug("hermes_agent: overlay set config.%s", key)
 
     def _resolve_model_base_url(self) -> str:
         # aiagent builds its own openai client; resolve policy_model url

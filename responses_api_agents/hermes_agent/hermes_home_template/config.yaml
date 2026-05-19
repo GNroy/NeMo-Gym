@@ -30,3 +30,11 @@ mcp_servers: {}
 delegation:
   max_spawn_depth: 1
   subagent_auto_approve: false
+
+# Phase 0.5: enable the bundled peer_agents plugin so the orchestrator's
+# `call_<worker>` tools are auto-registered from the overlay JSON.  The
+# plugin no-ops cleanly when peer_agents: is empty (workers and
+# single-agent benchmark runs), so it is safe to leave enabled by default.
+plugins:
+  enabled:
+  - peer_agents

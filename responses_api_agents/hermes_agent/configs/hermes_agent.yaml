@@ -26,3 +26,7 @@ hermes_agent:
       enable_compression: false
       trace_dir: null
       agent_name: null
+      # Phase 0.5: orchestrator-facing peer map.  Populated by the
+      # ns hermes_agent_rollouts pipeline via overlay JSON; the bundled
+      # peer_agents Hermes plugin registers a `call_<name>` tool per entry.
+      peer_agents: null

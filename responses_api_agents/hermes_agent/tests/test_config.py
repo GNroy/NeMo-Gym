@@ -45,6 +45,8 @@ def test_config_yaml_parses():
     assert inner["enable_compression"] is False
     assert inner["trace_dir"] is None
     assert inner["agent_name"] is None
+    # Phase 0.5: peer_agents map (orchestrator-facing).
+    assert inner["peer_agents"] is None
 
 
 def test_hermes_home_template_layout():
@@ -63,6 +65,9 @@ def test_hermes_home_template_layout():
     assert (root / "skills" / "seed" / "sci-research-notes" / "SKILL.md").is_file()
     assert (root / "skills" / "seed" / "sci-research-cite" / "SKILL.md").is_file()
     assert (root / "logs").is_dir()
+    # Phase 0.5: bundled peer_agents plugin.
+    assert (root / "plugins" / "peer_agents" / "plugin.yaml").is_file()
+    assert (root / "plugins" / "peer_agents" / "__init__.py").is_file()
 
 
 if __name__ == "__main__":
