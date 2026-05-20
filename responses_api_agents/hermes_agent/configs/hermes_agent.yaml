@@ -30,3 +30,8 @@ hermes_agent:
       # ns hermes_agent_rollouts pipeline via overlay JSON; the bundled
       # peer_agents Hermes plugin registers a `call_<name>` tool per entry.
       peer_agents: null
+      # Phase 6 (validation): per-model chat_template_kwargs override
+      # merged into every outbound LLM request.  Use ``{thinking: false}``
+      # for Kimi-K2.6; leaving null keeps the default Qwen-style
+      # ``enable_thinking=True`` behaviour baked into the outbound patch.
+      chat_template_kwargs: null

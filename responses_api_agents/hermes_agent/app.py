@@ -192,6 +192,13 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     # ``SLURM_MASTER_NODE_HET_GROUP_N`` env vars so the same overlay JSON
     # works regardless of which node SLURM picks for each het-group.
     peer_agents: Optional[Dict[str, Dict[str, Any]]] = None
+    # --- Phase 6 (validation) additions -----------------------------------
+    # Optional model-specific ``chat_template_kwargs`` merged into every
+    # outbound LLM request.  Hermes' default patch sets
+    # ``enable_thinking=True`` (Qwen-family convention); models with
+    # different toggles need a manifest override, e.g. Kimi-K2.6 expects
+    # ``{thinking: false}``.  Keys here win over the patch defaults.
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
 
 
 class HermesAgentRunRequest(BaseRunRequest):
@@ -436,9 +443,16 @@ class HermesAgent(SimpleResponsesAPIAgent):
 
         _original_build_api_kwargs = agent._build_api_kwargs
 
+        chat_template_overrides = self.config.chat_template_kwargs or {}
+
         def _patched_build_api_kwargs(api_messages):
             kw = _original_build_api_kwargs(api_messages)
             ctk = kw.setdefault("extra_body", {}).setdefault("chat_template_kwargs", {})
+            # Manifest-supplied keys win — Kimi-K2.6 uses ``thinking`` while
+            # Qwen-family uses ``enable_thinking``, so the default below
+            # only applies when no override was set for that key.
+            for key, value in chat_template_overrides.items():
+                ctk[key] = value
             ctk.setdefault("enable_thinking", True)
             ctk["truncate_history_thinking"] = False
             return kw
