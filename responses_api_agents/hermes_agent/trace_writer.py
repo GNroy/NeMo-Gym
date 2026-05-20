@@ -183,13 +183,20 @@ def build_callbacks(
         )
 
     def step_callback(*args: Any, **kwargs: Any) -> None:
-        # Observed signature: (api_call_count, prev_tools)
-        api_call_count = args[0] if len(args) > 0 else kwargs.get("api_call_count")
-        prev_tools = args[1] if len(args) > 1 else kwargs.get("prev_tools")
-        _emit(
-            "step",
-            {"api_call_count": api_call_count, "prev_tools": prev_tools},
-        )
+        # Observed signature: (api_call_count, prev_tools).  When
+        # ``save_trajectories=True`` Hermes also passes ``prompt_token_ids``,
+        # ``generation_token_ids`` and ``generation_log_probs`` per step; we
+        # forward every kwarg so RL training has the raw per-agent
+        # trajectories without a second pass over the trace schema.
+        payload: Dict[str, Any] = {
+            "api_call_count": args[0] if len(args) > 0 else kwargs.get("api_call_count"),
+            "prev_tools": args[1] if len(args) > 1 else kwargs.get("prev_tools"),
+        }
+        for key, value in kwargs.items():
+            if key in payload:
+                continue
+            payload[key] = value
+        _emit("step", payload)
 
     def thinking_callback(*args: Any, **kwargs: Any) -> None:
         # Observed signature: (msg,)

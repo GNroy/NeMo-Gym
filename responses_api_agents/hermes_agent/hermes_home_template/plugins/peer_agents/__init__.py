@@ -57,18 +57,20 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TIMEOUT_S = 600.0
 
 
+# Session id used for the orchestrator-side delegation trace.  Per-call
+# session_id is not surfaced to plugin handlers by hermes-agent, so we use a
+# single shared file per orchestrator process; the fleet renderer joins
+# delegation events with worker session events by ticket_id (= task_id).
+_DELEGATION_SESSION_ID = "delegations"
+
+
 # ---------------------------------------------------------------------------
 # Overlay loader
 # ---------------------------------------------------------------------------
 
 
-def _load_peer_agents() -> Dict[str, Dict[str, Any]]:
-    """Read the peer-agents map from the active HERMES_HOME's overlay JSON.
-
-    Returns an empty dict if the file is absent, malformed, or carries no
-    ``peer_agents`` key.  An empty dict means *register no tools* — the
-    Hermes plugin loader treats that as a soft no-op.
-    """
+def _load_overlay() -> Dict[str, Any]:
+    """Return the parsed overlay JSON dict (or ``{}`` if absent/malformed)."""
     hermes_home = os.environ.get("HERMES_HOME", "").strip()
     if not hermes_home:
         try:
@@ -89,6 +91,17 @@ def _load_peer_agents() -> Dict[str, Dict[str, Any]]:
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("peer_agents: could not read overlay %s: %s", overlay_path, exc)
         return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _load_peer_agents() -> Dict[str, Dict[str, Any]]:
+    """Read the peer-agents map from the active HERMES_HOME's overlay JSON.
+
+    Returns an empty dict if the file is absent, malformed, or carries no
+    ``peer_agents`` key.  An empty dict means *register no tools* — the
+    Hermes plugin loader treats that as a soft no-op.
+    """
+    data = _load_overlay()
     peers = data.get("peer_agents") if isinstance(data, dict) else None
     if not isinstance(peers, dict):
         return {}
@@ -128,12 +141,50 @@ def _resolve_host(peer: Dict[str, Any]) -> str:
     return host or "localhost"
 
 
-def _call_peer(peer_name: str, peer: Dict[str, Any], task: str) -> Dict[str, Any]:
+def _emit_delegation(kind_payload: Dict[str, Any]) -> None:
+    """Best-effort delegation-event emit into the orchestrator's trace tree.
+
+    Skips silently when the overlay does not declare ``trace_dir`` /
+    ``agent_name`` (e.g. unit tests, or a single-agent benchmark run).
+    Tracing must never take down a delegation, so any IO/Import error is
+    swallowed with a debug log line.
+    """
+    try:
+        overlay = _load_overlay()
+        trace_dir = overlay.get("trace_dir")
+        agent_name = overlay.get("agent_name") or "orchestrator"
+        if not trace_dir:
+            return
+        from responses_api_agents.hermes_agent.trace_writer import emit_event
+
+        emit_event(
+            trace_dir,
+            agent_name,
+            _DELEGATION_SESSION_ID,
+            "delegation",
+            kind_payload,
+        )
+    except Exception as exc:  # noqa: BLE001 - tracing is best-effort
+        logger.debug("peer_agents: delegation emit failed: %s", exc)
+
+
+def _call_peer(
+    peer_name: str,
+    peer: Dict[str, Any],
+    task: str,
+    *,
+    ticket_id: Optional[str] = None,
+) -> Dict[str, Any]:
     """POST a task to a peer's ``/task`` endpoint, return ``{generation, error}``."""
     host = _resolve_host(peer)
     url = f"http://{host}:{peer['port']}/task"
+    # Reuse the supplied ticket_id as the wire task_id so the worker's
+    # ``session_id`` (from HermesAgent._resolve_session_id) matches the
+    # ticket_id this orchestrator emits in its delegation event — that
+    # equality is the join key for the fleet trace renderer.
+    task_id = ticket_id or uuid.uuid4().hex
     payload = {
-        "task_id": uuid.uuid4().hex,
+        "task_id": task_id,
         "messages": [{"role": "user", "content": task}],
     }
     body = json.dumps(payload).encode("utf-8")
@@ -177,7 +228,34 @@ def _make_call_tool_handler(peer_name: str, peer: Dict[str, Any]):
         task = args.get("task") if isinstance(args, dict) else None
         if not isinstance(task, str) or not task:
             return json.dumps({"success": False, "error": f"call_{peer_name} requires non-empty 'task' string"})
-        result = _call_peer(peer_name, peer, task)
+
+        ticket_id = uuid.uuid4().hex
+        task_preview = task[:200].replace("\n", " ")
+        _emit_delegation(
+            {
+                "mode": "blocking",
+                "worker": peer_name,
+                "ticket_id": ticket_id,
+                "task_preview": task_preview,
+            }
+        )
+
+        result = _call_peer(peer_name, peer, task, ticket_id=ticket_id)
+
+        # Pair the dispatch with a result event so the renderer can show
+        # both the call and its outcome in line with the orchestrator's
+        # other tool calls.  ``ok=False`` carries the peer's error message.
+        result_text = result["generation"] if not result["error"] else result["error"]
+        _emit_delegation(
+            {
+                "mode": "result",
+                "worker": peer_name,
+                "ticket_id": ticket_id,
+                "ok": not result["error"],
+                "result_preview": (result_text or "")[:200],
+            }
+        )
+
         # Hermes tools must return a JSON-encoded string; wrap into a
         # success/result/error envelope to match the in-tree tool convention.
         if result["error"]:
