@@ -199,6 +199,14 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     # different toggles need a manifest override, e.g. Kimi-K2.6 expects
     # ``{thinking: false}``.  Keys here win over the patch defaults.
     chat_template_kwargs: Optional[Dict[str, Any]] = None
+    # Some vLLM builds (e.g. ``vllm-glm51-cu130-ray.sqsh`` used for
+    # Kimi-K2.6) hard-reject ``stream=True`` with a 422.  Hermes' default
+    # conversation loop uses streaming for health-check granularity, but
+    # we expose a manifest knob to disable it via ``agent._disable_streaming``
+    # before ``run_conversation``.  Leave ``False`` for vLLM builds that
+    # accept streaming (better staleness detection); flip to ``True`` for
+    # strict-non-stream backends.
+    disable_streaming: bool = False
 
 
 class HermesAgentRunRequest(BaseRunRequest):
@@ -417,13 +425,20 @@ class HermesAgent(SimpleResponsesAPIAgent):
         else:
             emit_event = None  # type: ignore[assignment]
 
+        # The current NousResearch/hermes-agent AIAgent.__init__ doesn't
+        # accept ``use_streaming``, ``temperature``, ``insert_reasoning``
+        # or ``persist_session`` — those were on a stale fork pin and
+        # have since been dropped.  Streaming defaults to off in the
+        # ``responses()`` path; sampling temperature is set per-request
+        # via _build_api_kwargs / request_overrides rather than at
+        # AIAgent construction; reasoning insertion is automatic when
+        # the model emits ``<think>`` blocks; and the agent's session
+        # persistence is governed by ``skip_memory`` + the agent's own
+        # ``_persist_session`` method rather than a constructor flag.
         agent = AIAgent(
             base_url=base_url,
             api_key="gym",  # pragma: allowlist secret
             model=model_name,
-            use_streaming=False,
-            temperature=self.config.temperature,
-            insert_reasoning=True,
             max_iterations=self.config.max_turns,
             enabled_toolsets=self.config.enabled_toolsets,
             disabled_toolsets=self.config.disabled_toolsets,
@@ -432,7 +447,6 @@ class HermesAgent(SimpleResponsesAPIAgent):
             # behavior; the new pipeline turns these on per agent.
             skip_context_files=not self.config.persist_memory,
             skip_memory=not self.config.persist_memory,
-            persist_session=self.config.persist_session,
             save_trajectories=self.config.save_trajectories,
             session_id=session_id,
             **agent_kwargs,
@@ -440,6 +454,11 @@ class HermesAgent(SimpleResponsesAPIAgent):
         # Context compression mutates trajectories non-monotonically; keep it
         # off unless explicitly enabled — RL training needs faithful traces.
         agent.compression_enabled = self.config.enable_compression
+        # When the backend rejects streaming (e.g. some vLLM builds 422 on
+        # ``stream=True``), short-circuit Hermes' default-stream code path.
+        # The flag is read inside ``conversation_loop.py`` before each turn.
+        if self.config.disable_streaming:
+            agent._disable_streaming = True
 
         _original_build_api_kwargs = agent._build_api_kwargs
 

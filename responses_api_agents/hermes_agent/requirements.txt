@@ -1,2 +1,9 @@
 -e nemo-gym[dev] @ ../../
-hermes-agent @ git+https://github.com/cmunley1/hermes-agent@26bb847a
+# NOTE: hermes-agent itself is NOT installed via pip here.  Its
+# dependencies (openai==2.24.0) conflict with NeMo-Gym's openai pin
+# (openai==2.7.2), and pinning either side breaks the other.  Instead,
+# callers stage the source tree and prepend it to PYTHONPATH via the
+# ``--hermes_agent_path`` flag on ``ns hermes_agent_rollouts`` (or
+# ``HERMES_AGENT_PATH`` env var) — see the head/rollouts scripts and
+# the Phase 6 section of workdir-agents/hermes_integration_plan.md.
+# Tracked upstream: NousResearch/hermes-agent@378bca1d

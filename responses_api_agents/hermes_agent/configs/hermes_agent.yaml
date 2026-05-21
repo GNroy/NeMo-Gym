@@ -35,3 +35,7 @@ hermes_agent:
       # for Kimi-K2.6; leaving null keeps the default Qwen-style
       # ``enable_thinking=True`` behaviour baked into the outbound patch.
       chat_template_kwargs: null
+      # When the backend rejects ``stream=True`` (some vLLM builds 422),
+      # flip this to True to take the non-streaming code path.  Default
+      # False preserves Hermes' streaming health-check semantics.
+      disable_streaming: false

@@ -329,7 +329,12 @@ class TestT07T08AIAgentKwargsFromFlags:
         kw = fake_aiagent.instances[0].kwargs
         assert kw["skip_memory"] is True  # persist_memory=False -> skip_memory=True
         assert kw["skip_context_files"] is True
-        assert kw["persist_session"] is False
+        # ``persist_session`` is intentionally no longer forwarded to
+        # AIAgent — NousResearch/hermes-agent dropped that constructor
+        # kwarg; the agent governs session persistence via skip_memory
+        # and its own _persist_session method.  We keep the config
+        # field for callers (test_t07 still verifies the config default).
+        assert "persist_session" not in kw
         assert kw["save_trajectories"] is False
         # Compression is set AFTER init; check the post-init attribute.
         assert fake_aiagent.instances[0].compression_enabled is False
@@ -349,7 +354,8 @@ class TestT07T08AIAgentKwargsFromFlags:
         kw = fake_aiagent.instances[0].kwargs
         assert kw["skip_memory"] is False
         assert kw["skip_context_files"] is False
-        assert kw["persist_session"] is True
+        # See test_t07 — persist_session no longer flows through.
+        assert "persist_session" not in kw
         assert kw["save_trajectories"] is True
         assert fake_aiagent.instances[0].compression_enabled is True
 
