@@ -51,15 +51,29 @@ from nemo_gym.openai_utils import (
 from nemo_gym.server_utils import get_response_json, raise_for_status
 
 
+def _coerce_content_text(value) -> str:
+    if isinstance(value, list):
+        return "".join((c.get("text", "") if isinstance(c, dict) else getattr(c, "text", "") or "") for c in value)
+    return value or ""
+
+
 def _trajectory_to_output_items(messages, n_input):
     output_items = []
     for item in messages[n_input:]:
         if not isinstance(item, dict):
             continue
         role = item.get("role")
-        content = item.get("content", "") or ""
-        if isinstance(content, list):
-            content = "".join(c.get("text", "") if isinstance(c, dict) else getattr(c, "text", "") for c in content)
+        content = _coerce_content_text(item.get("content"))
+        # Some thinking-mode reasoning parsers (vLLM's kimi_k2 with K2.6,
+        # deepseek_v4, ...) place the visible reply in ``reasoning_content`` /
+        # ``reasoning`` while leaving ``content`` empty; Hermes also strips
+        # inline ``<think>`` blocks from content at storage time. Without a
+        # fallback we'd persist empty assistant turns even when the model
+        # emitted a real reply. Mirrors the stirrup_agent fix (#1397).
+        if role == "assistant" and not content.strip():
+            content = _coerce_content_text(item.get("reasoning_content")) or _coerce_content_text(
+                item.get("reasoning")
+            )
         if role == "assistant":
             output_items.append(
                 NeMoGymResponseOutputMessageForTraining(
@@ -498,6 +512,27 @@ class HermesAgent(SimpleResponsesAPIAgent):
         messages = result.get("messages") or []
         # aiagent omits system from returned messages
         n_input = len(history) + 1
+
+        # Opt-in diagnostic for the empty-content investigation.  When
+        # ``HERMES_DEBUG_MESSAGES=1``, log every returned message's shape
+        # (role, content/reasoning lengths, presence of tool_calls, full key
+        # list) to stderr so we can tell whether the model emitted text into
+        # ``content``, ``reasoning_content``, ``reasoning``, or nowhere.
+        if os.environ.get("HERMES_DEBUG_MESSAGES"):
+            for _idx, _m in enumerate(messages):
+                if not isinstance(_m, dict):
+                    continue
+                LOG.warning(
+                    "hermes_msg[%d] role=%s content_len=%d reasoning_len=%d "
+                    "reasoning_content_len=%d tool_calls=%s keys=%s",
+                    _idx,
+                    _m.get("role"),
+                    len(_coerce_content_text(_m.get("content"))),
+                    len(_coerce_content_text(_m.get("reasoning"))),
+                    len(_coerce_content_text(_m.get("reasoning_content"))),
+                    bool(_m.get("tool_calls")),
+                    sorted(_m.keys()),
+                )
 
         output_items = _trajectory_to_output_items(messages, n_input)
 
