@@ -57,6 +57,59 @@ def _coerce_content_text(value) -> str:
     return value or ""
 
 
+def _promote_reasoning_to_content(response) -> None:
+    """Mutate response in place: copy reasoning_content into content when content is empty.
+
+    Some thinking models — Kimi-K2.6 with ``--reasoning-parser kimi_k2`` is
+    the documented case — emit the entire visible reply through
+    ``reasoning_content`` and leave ``content=""``.  Hermes' default
+    conversation loop interprets that shape as a model failure and burns
+    its retry budget before bailing with ``content="(empty)"``.  Promoting
+    here lets Hermes see populated content and run the normal flow.
+
+    No-op when content already has visible text, or when the response
+    object doesn't expose the expected attributes.
+    """
+    if response is None:
+        return
+    choices = getattr(response, "choices", None) or []
+    for choice in choices:
+        msg = getattr(choice, "message", None)
+        if msg is None:
+            continue
+        content = getattr(msg, "content", None) or ""
+        if isinstance(content, str) and content.strip():
+            continue
+        rc = getattr(msg, "reasoning_content", None)
+        if rc is None and hasattr(msg, "model_extra"):
+            rc = (getattr(msg, "model_extra", None) or {}).get("reasoning_content")
+        if isinstance(rc, str) and rc.strip():
+            try:
+                msg.content = rc
+            except (AttributeError, TypeError):
+                # Pydantic models with frozen=True or read-only attrs —
+                # skip silently rather than crash the agent loop.
+                pass
+
+
+def _wrap_api_calls_with_reasoning_promotion(agent) -> None:
+    """Wrap both API call paths so responses get content-promoted before Hermes sees them."""
+    for attr in ("_interruptible_api_call", "_interruptible_streaming_api_call"):
+        original = getattr(agent, attr, None)
+        if original is None or not callable(original):
+            continue
+
+        def make_wrapper(orig):
+            def _wrapper(*args, **kwargs):
+                response = orig(*args, **kwargs)
+                _promote_reasoning_to_content(response)
+                return response
+
+            return _wrapper
+
+        setattr(agent, attr, make_wrapper(original))
+
+
 def _trajectory_to_output_items(messages, n_input):
     output_items = []
     for item in messages[n_input:]:
@@ -221,6 +274,19 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     # accept streaming (better staleness detection); flip to ``True`` for
     # strict-non-stream backends.
     disable_streaming: bool = False
+    # Promote ``message.reasoning_content`` into ``message.content`` on
+    # API responses whose ``content`` is empty.  Required for Kimi-K2.6
+    # with ``--reasoning-parser kimi_k2``: K2.6 routes the visible reply
+    # entirely through ``reasoning_content`` (10k+ chars of real answer)
+    # and leaves ``content=""``.  Hermes' default loop interprets that as
+    # a model failure, burns its thinking-prefill + empty-content retry
+    # budgets (~5 retries × 60s each), then writes ``content="(empty)"``
+    # and gives up — even though the answer was right there in
+    # ``reasoning_content``.  Promotion mutates the response object
+    # before Hermes consumes it, so Hermes sees populated content and
+    # runs the normal one-pass flow.  Safe for non-thinking models
+    # (no-op when ``content`` is already populated).
+    promote_reasoning_to_content: bool = False
 
 
 class HermesAgentRunRequest(BaseRunRequest):
@@ -491,6 +557,9 @@ class HermesAgent(SimpleResponsesAPIAgent):
             return kw
 
         agent._build_api_kwargs = _patched_build_api_kwargs
+
+        if self.config.promote_reasoning_to_content:
+            _wrap_api_calls_with_reasoning_promotion(agent)
 
         try:
             result = await asyncio.to_thread(
