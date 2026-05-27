@@ -7,8 +7,16 @@
 # specific belongs in the overlay, not here, so the template stays portable
 # across cluster/profile combinations.
 
-# Model providers are configured at runtime by the pipeline; leave empty here.
-model: null
+# Model providers are configured at runtime by the pipeline.  Stub the
+# ``model.provider`` field with ``custom`` so Hermes' aux client can
+# resolve ``auxiliary.<task>.provider: main`` against a known main
+# provider — without this, ``_read_main_provider()`` returns "" and the
+# aux client reports the configured ``main`` provider as "unavailable"
+# (and falls back to no-summary compression).  The pipeline still
+# overlays the real base_url + api_key via env vars (OPENAI_BASE_URL /
+# OPENAI_API_KEY) so this is purely a routing-tag knob.
+model:
+  provider: custom
 providers: {}
 
 # Persistent memory and skills are managed by the curator / merge-back step.
