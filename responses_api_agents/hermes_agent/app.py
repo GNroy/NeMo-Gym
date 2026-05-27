@@ -80,9 +80,15 @@ def _promote_reasoning_to_content(response) -> None:
         content = getattr(msg, "content", None) or ""
         if isinstance(content, str) and content.strip():
             continue
+        # vLLM 0.16+'s ``--reasoning-parser kimi_k2`` exposes the visible
+        # reply on ``message.reasoning`` (legacy Responses-API key); other
+        # parsers / model families use ``reasoning_content``.  Check both.
         rc = getattr(msg, "reasoning_content", None)
-        if rc is None and hasattr(msg, "model_extra"):
-            rc = (getattr(msg, "model_extra", None) or {}).get("reasoning_content")
+        if not rc:
+            rc = getattr(msg, "reasoning", None)
+        if not rc and hasattr(msg, "model_extra"):
+            extra = getattr(msg, "model_extra", None) or {}
+            rc = extra.get("reasoning_content") or extra.get("reasoning")
         if isinstance(rc, str) and rc.strip():
             try:
                 msg.content = rc
@@ -552,7 +558,18 @@ class HermesAgent(SimpleResponsesAPIAgent):
             # only applies when no override was set for that key.
             for key, value in chat_template_overrides.items():
                 ctk[key] = value
-            ctk.setdefault("enable_thinking", True)
+            # Only default ``enable_thinking=True`` when the manifest hasn't
+            # already disabled thinking by some name.  K2.6's chat template
+            # honours ``thinking``; sending both ``thinking: False`` and
+            # ``enable_thinking: True`` lands as conflicting signals and the
+            # model thinks anyway (pilot 2026-05-26 confirmed reasoning_len
+            # > 8 k chars with content empty despite ``thinking: False``).
+            _thinking_disabled = (
+                chat_template_overrides.get("thinking") is False
+                or chat_template_overrides.get("enable_thinking") is False
+            )
+            if not _thinking_disabled:
+                ctk.setdefault("enable_thinking", True)
             ctk["truncate_history_thinking"] = False
             return kw
 
