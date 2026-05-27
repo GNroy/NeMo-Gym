@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from asyncio import Semaphore
 from pathlib import Path
@@ -57,6 +58,39 @@ def _coerce_content_text(value) -> str:
     return value or ""
 
 
+_THINK_BLOCK_RE = re.compile(
+    r"<(think|thinking|reasoning|REASONING_SCRATCHPAD|thought)>(.*?)</\1>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _unwrap_inline_think_blocks(content: str) -> str:
+    """Replace ``<think>…</think>``-style blocks with their inner text.
+
+    K2.6 with certain prompt shapes (tools + large system prompts) returns
+    ``message.content`` consisting *entirely* of ``<think>…</think>`` blocks,
+    even when vLLM's ``--reasoning-parser kimi_k2`` works fine for simpler
+    probes.  Hermes' ``_strip_think_blocks`` then removes the tags AND their
+    contents, reducing content to empty and triggering the thinking-prefill
+    retry cascade.
+
+    To prevent that, only when the content has no visible text *outside* the
+    think tags, we rewrite the tags into their inner text so the visible
+    reply survives Hermes' strip pass.  Tag mix (``<think>``, ``<thinking>``,
+    ``<reasoning>``, ``<REASONING_SCRATCHPAD>``, ``<thought>``) matches what
+    ``strip_think_blocks`` in hermes-agent/agent/agent_runtime_helpers.py
+    recognises.
+    """
+    if not content or "<" not in content:
+        return content
+    outside_text = _THINK_BLOCK_RE.sub("", content).strip()
+    if outside_text:
+        # Content has real text outside the think tags — Hermes' strip leaves
+        # that visible portion intact; no need to unwrap.
+        return content
+    return _THINK_BLOCK_RE.sub(lambda m: m.group(2), content)
+
+
 def _promote_reasoning_to_content(response) -> None:
     """Mutate response in place: copy reasoning_content into content when content is empty.
 
@@ -79,6 +113,16 @@ def _promote_reasoning_to_content(response) -> None:
             continue
         content = getattr(msg, "content", None) or ""
         if isinstance(content, str) and content.strip():
+            # Content is populated — but K2.6 with tools sometimes wraps the
+            # entire reply in ``<think>…</think>``-style tags inside content
+            # (vLLM's reasoning parser didn't fire).  Hermes would then strip
+            # those and reduce content to empty.  Unwrap before that happens.
+            unwrapped = _unwrap_inline_think_blocks(content)
+            if unwrapped is not content:
+                try:
+                    msg.content = unwrapped
+                except (AttributeError, TypeError):
+                    pass
             continue
         # vLLM 0.16+'s ``--reasoning-parser kimi_k2`` exposes the visible
         # reply on ``message.reasoning`` (legacy Responses-API key); other
@@ -100,20 +144,49 @@ def _promote_reasoning_to_content(response) -> None:
 
 def _wrap_api_calls_with_reasoning_promotion(agent) -> None:
     """Wrap both API call paths so responses get content-promoted before Hermes sees them."""
+    debug = bool(os.environ.get("HERMES_DEBUG_MESSAGES"))
+    if debug:
+        LOG.warning("hermes_promote: wrapping API calls on agent id=%s", id(agent))
     for attr in ("_interruptible_api_call", "_interruptible_streaming_api_call"):
         original = getattr(agent, attr, None)
         if original is None or not callable(original):
+            if debug:
+                LOG.warning("hermes_promote: skip %s (callable=%s)", attr, callable(original))
             continue
 
-        def make_wrapper(orig):
+        def make_wrapper(orig, attr_name):
             def _wrapper(*args, **kwargs):
                 response = orig(*args, **kwargs)
+                if debug:
+                    msg = None
+                    try:
+                        msg = response.choices[0].message
+                        before = len(getattr(msg, "content", None) or "")
+                        rc_attr = getattr(msg, "reasoning_content", None)
+                        r_attr = getattr(msg, "reasoning", None)
+                        LOG.warning(
+                            "hermes_promote(%s) before: content_len=%d reasoning_len=%d reasoning_content_len=%d msg_keys=%s",
+                            attr_name,
+                            before,
+                            len(r_attr or ""),
+                            len(rc_attr or ""),
+                            sorted(getattr(msg, "model_fields_set", None) or set())
+                            or [k for k in dir(msg) if not k.startswith("_")][:20],
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        LOG.warning("hermes_promote(%s) inspect failed: %s", attr_name, e)
                 _promote_reasoning_to_content(response)
+                if debug and msg is not None:
+                    LOG.warning(
+                        "hermes_promote(%s) after: content_len=%d",
+                        attr_name,
+                        len(getattr(msg, "content", None) or ""),
+                    )
                 return response
 
             return _wrapper
 
-        setattr(agent, attr, make_wrapper(original))
+        setattr(agent, attr, make_wrapper(original, attr))
 
 
 def _trajectory_to_output_items(messages, n_input):

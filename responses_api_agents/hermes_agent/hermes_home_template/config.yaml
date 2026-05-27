@@ -38,3 +38,24 @@ delegation:
 plugins:
   enabled:
   - peer_agents
+
+# Route Hermes' auxiliary side-tasks (context compression, session search,
+# web-extract, vision) at the **main** policy endpoint instead of an
+# external aux provider.  In our cluster pipeline the main endpoint is the
+# already-warm vLLM daemon, so the aux client reuses it via
+# OPENAI_BASE_URL + OPENAI_API_KEY (exported by the rollout sbatch).  This
+# silences "No auxiliary LLM provider configured — context compression
+# will drop middle turns without a summary" and gives compression an
+# actual model to summarise with.
+#
+# Vision tasks will only succeed when the main model is multimodal; for
+# K2.6 they no-op gracefully (the bench is text-only).
+auxiliary:
+  compression:
+    provider: main
+  session_search:
+    provider: main
+  web_extract:
+    provider: main
+  vision:
+    provider: main
