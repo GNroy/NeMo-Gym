@@ -1,0 +1,7 @@
+passthrough:
+  resources_servers:
+    passthrough:
+      entrypoint: app.py
+      domain: agent
+      verified: false
+      description: No-op verifier — emits reward=0.0 so offline judges can grade the generation later.

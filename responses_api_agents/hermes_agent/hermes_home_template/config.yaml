@@ -1,0 +1,69 @@
+# Hermes Agent config template for NeMo-Skills multi-agent runs.
+#
+# This file is the BASELINE for every per-agent HERMES_HOME the pipeline
+# materializes at job start.  The pipeline overlays agent-specific fields
+# (provider/model URL, mcp_servers entries, terminal backend) after copying
+# this template.  Keep this file minimal — anything model- or provider-
+# specific belongs in the overlay, not here, so the template stays portable
+# across cluster/profile combinations.
+
+# Model providers are configured at runtime by the pipeline.  Stub the
+# ``model.provider`` field with ``custom`` so Hermes' aux client can
+# resolve ``auxiliary.<task>.provider: main`` against a known main
+# provider — without this, ``_read_main_provider()`` returns "" and the
+# aux client reports the configured ``main`` provider as "unavailable"
+# (and falls back to no-summary compression).  The pipeline still
+# overlays the real base_url + api_key via env vars (OPENAI_BASE_URL /
+# OPENAI_API_KEY) so this is purely a routing-tag knob.
+model:
+  provider: custom
+providers: {}
+
+# Persistent memory and skills are managed by the curator / merge-back step.
+# Defaults below match the merge-back policy: ``MEMORY.md``, ``USER.md``,
+# and ``skills/user/`` survive across runs; everything else is per-run.
+memory:
+  enabled: true
+  user_profile_enabled: false
+
+skills:
+  creation_nudge_interval: 10
+
+# MCP servers are injected by the pipeline overlay (one stanza per NS-MCP
+# tool the agent should see).  Keep this map empty in the template so a
+# stale entry doesn't shadow what the pipeline wires up.
+mcp_servers: {}
+
+# Delegation defaults; the orchestrator may override via overlay.
+delegation:
+  max_spawn_depth: 1
+  subagent_auto_approve: false
+
+# Phase 0.5: enable the bundled peer_agents plugin so the orchestrator's
+# `call_<worker>` tools are auto-registered from the overlay JSON.  The
+# plugin no-ops cleanly when peer_agents: is empty (workers and
+# single-agent benchmark runs), so it is safe to leave enabled by default.
+plugins:
+  enabled:
+  - peer_agents
+
+# Route Hermes' auxiliary side-tasks (context compression, session search,
+# web-extract, vision) at the **main** policy endpoint instead of an
+# external aux provider.  In our cluster pipeline the main endpoint is the
+# already-warm vLLM daemon, so the aux client reuses it via
+# OPENAI_BASE_URL + OPENAI_API_KEY (exported by the rollout sbatch).  This
+# silences "No auxiliary LLM provider configured — context compression
+# will drop middle turns without a summary" and gives compression an
+# actual model to summarise with.
+#
+# Vision tasks will only succeed when the main model is multimodal; for
+# K2.6 they no-op gracefully (the bench is text-only).
+auxiliary:
+  compression:
+    provider: main
+  session_search:
+    provider: main
+  web_extract:
+    provider: main
+  vision:
+    provider: main

@@ -35,9 +35,43 @@ def test_config_yaml_parses():
     assert inner["terminal_backend"] == "local"
     assert inner["terminal_timeout"] == 60
     assert "disabled_toolsets" not in inner
+    # Phase 0: new fields are present with defaults that preserve the
+    # original benchmark behavior (no persistence, no traces).
+    assert inner["hermes_home"] is None
+    assert inner["persist_memory"] is False
+    assert inner["persist_skills"] is False
+    assert inner["persist_session"] is False
+    assert inner["save_trajectories"] is False
+    assert inner["enable_compression"] is False
+    assert inner["trace_dir"] is None
+    assert inner["agent_name"] is None
+    # Phase 0.5: peer_agents map (orchestrator-facing).
+    assert inner["peer_agents"] is None
+
+
+def test_hermes_home_template_layout():
+    """T0 hardening: the bundled template ships the directory shape the
+    Phase 1 bootstrap script will copy.  If a subdirectory is missing here,
+    the per-run snapshot will silently drop it and the curator's merge-back
+    allowlist will have nothing to write into."""
+    root = Path(__file__).resolve().parent.parent / "hermes_home_template"
+    assert (root / "config.yaml").is_file()
+    # .env is gitignored project-wide, so the template ships env.example and
+    # the Phase 1 bootstrap script copies it to .env at materialization time.
+    assert (root / "env.example").is_file()
+    assert (root / "MEMORY.md").is_file()
+    assert (root / "USER.md").is_file()
+    assert (root / "skills" / "user").is_dir()
+    assert (root / "skills" / "seed" / "sci-research-notes" / "SKILL.md").is_file()
+    assert (root / "skills" / "seed" / "sci-research-cite" / "SKILL.md").is_file()
+    assert (root / "logs").is_dir()
+    # Phase 0.5: bundled peer_agents plugin.
+    assert (root / "plugins" / "peer_agents" / "plugin.yaml").is_file()
+    assert (root / "plugins" / "peer_agents" / "__init__.py").is_file()
 
 
 if __name__ == "__main__":
     test_module_parses()
     test_config_yaml_parses()
+    test_hermes_home_template_layout()
     print("OK")

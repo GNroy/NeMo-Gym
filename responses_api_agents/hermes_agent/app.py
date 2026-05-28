@@ -14,17 +14,20 @@
 # limitations under the License.
 
 import asyncio
+import json
 import logging
 import os
+import re
 import sys
 from asyncio import Semaphore
+from pathlib import Path
 from time import time
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 import model_tools  # noqa: F401  # fail-fast if hermes-agent isn't installed
-from fastapi import Request
-from pydantic import ConfigDict
+from fastapi import FastAPI, Request
+from pydantic import BaseModel, ConfigDict
 
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
 from nemo_gym.base_responses_api_agent import (
@@ -49,15 +52,160 @@ from nemo_gym.openai_utils import (
 from nemo_gym.server_utils import get_response_json, raise_for_status
 
 
+def _coerce_content_text(value) -> str:
+    if isinstance(value, list):
+        return "".join((c.get("text", "") if isinstance(c, dict) else getattr(c, "text", "") or "") for c in value)
+    return value or ""
+
+
+_THINK_BLOCK_RE = re.compile(
+    r"<(think|thinking|reasoning|REASONING_SCRATCHPAD|thought)>(.*?)</\1>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _unwrap_inline_think_blocks(content: str) -> str:
+    """Replace ``<think>…</think>``-style blocks with their inner text.
+
+    K2.6 with certain prompt shapes (tools + large system prompts) returns
+    ``message.content`` consisting *entirely* of ``<think>…</think>`` blocks,
+    even when vLLM's ``--reasoning-parser kimi_k2`` works fine for simpler
+    probes.  Hermes' ``_strip_think_blocks`` then removes the tags AND their
+    contents, reducing content to empty and triggering the thinking-prefill
+    retry cascade.
+
+    To prevent that, only when the content has no visible text *outside* the
+    think tags, we rewrite the tags into their inner text so the visible
+    reply survives Hermes' strip pass.  Tag mix (``<think>``, ``<thinking>``,
+    ``<reasoning>``, ``<REASONING_SCRATCHPAD>``, ``<thought>``) matches what
+    ``strip_think_blocks`` in hermes-agent/agent/agent_runtime_helpers.py
+    recognises.
+    """
+    if not content or "<" not in content:
+        return content
+    outside_text = _THINK_BLOCK_RE.sub("", content).strip()
+    if outside_text:
+        # Content has real text outside the think tags — Hermes' strip leaves
+        # that visible portion intact; no need to unwrap.
+        return content
+    return _THINK_BLOCK_RE.sub(lambda m: m.group(2), content)
+
+
+def _promote_reasoning_to_content(response) -> None:
+    """Mutate response in place: copy reasoning_content into content when content is empty.
+
+    Some thinking models — Kimi-K2.6 with ``--reasoning-parser kimi_k2`` is
+    the documented case — emit the entire visible reply through
+    ``reasoning_content`` and leave ``content=""``.  Hermes' default
+    conversation loop interprets that shape as a model failure and burns
+    its retry budget before bailing with ``content="(empty)"``.  Promoting
+    here lets Hermes see populated content and run the normal flow.
+
+    No-op when content already has visible text, or when the response
+    object doesn't expose the expected attributes.
+    """
+    if response is None:
+        return
+    choices = getattr(response, "choices", None) or []
+    for choice in choices:
+        msg = getattr(choice, "message", None)
+        if msg is None:
+            continue
+        content = getattr(msg, "content", None) or ""
+        if isinstance(content, str) and content.strip():
+            # Content is populated — but K2.6 with tools sometimes wraps the
+            # entire reply in ``<think>…</think>``-style tags inside content
+            # (vLLM's reasoning parser didn't fire).  Hermes would then strip
+            # those and reduce content to empty.  Unwrap before that happens.
+            unwrapped = _unwrap_inline_think_blocks(content)
+            if unwrapped is not content:
+                try:
+                    msg.content = unwrapped
+                except (AttributeError, TypeError):
+                    pass
+            continue
+        # vLLM 0.16+'s ``--reasoning-parser kimi_k2`` exposes the visible
+        # reply on ``message.reasoning`` (legacy Responses-API key); other
+        # parsers / model families use ``reasoning_content``.  Check both.
+        rc = getattr(msg, "reasoning_content", None)
+        if not rc:
+            rc = getattr(msg, "reasoning", None)
+        if not rc and hasattr(msg, "model_extra"):
+            extra = getattr(msg, "model_extra", None) or {}
+            rc = extra.get("reasoning_content") or extra.get("reasoning")
+        if isinstance(rc, str) and rc.strip():
+            try:
+                msg.content = rc
+            except (AttributeError, TypeError):
+                # Pydantic models with frozen=True or read-only attrs —
+                # skip silently rather than crash the agent loop.
+                pass
+
+
+def _wrap_api_calls_with_reasoning_promotion(agent) -> None:
+    """Wrap both API call paths so responses get content-promoted before Hermes sees them."""
+    debug = bool(os.environ.get("HERMES_DEBUG_MESSAGES"))
+    if debug:
+        LOG.warning("hermes_promote: wrapping API calls on agent id=%s", id(agent))
+    for attr in ("_interruptible_api_call", "_interruptible_streaming_api_call"):
+        original = getattr(agent, attr, None)
+        if original is None or not callable(original):
+            if debug:
+                LOG.warning("hermes_promote: skip %s (callable=%s)", attr, callable(original))
+            continue
+
+        def make_wrapper(orig, attr_name):
+            def _wrapper(*args, **kwargs):
+                response = orig(*args, **kwargs)
+                if debug:
+                    msg = None
+                    try:
+                        msg = response.choices[0].message
+                        before = len(getattr(msg, "content", None) or "")
+                        rc_attr = getattr(msg, "reasoning_content", None)
+                        r_attr = getattr(msg, "reasoning", None)
+                        LOG.warning(
+                            "hermes_promote(%s) before: content_len=%d reasoning_len=%d reasoning_content_len=%d msg_keys=%s",
+                            attr_name,
+                            before,
+                            len(r_attr or ""),
+                            len(rc_attr or ""),
+                            sorted(getattr(msg, "model_fields_set", None) or set())
+                            or [k for k in dir(msg) if not k.startswith("_")][:20],
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        LOG.warning("hermes_promote(%s) inspect failed: %s", attr_name, e)
+                _promote_reasoning_to_content(response)
+                if debug and msg is not None:
+                    LOG.warning(
+                        "hermes_promote(%s) after: content_len=%d",
+                        attr_name,
+                        len(getattr(msg, "content", None) or ""),
+                    )
+                return response
+
+            return _wrapper
+
+        setattr(agent, attr, make_wrapper(original, attr))
+
+
 def _trajectory_to_output_items(messages, n_input):
     output_items = []
     for item in messages[n_input:]:
         if not isinstance(item, dict):
             continue
         role = item.get("role")
-        content = item.get("content", "") or ""
-        if isinstance(content, list):
-            content = "".join(c.get("text", "") if isinstance(c, dict) else getattr(c, "text", "") for c in content)
+        content = _coerce_content_text(item.get("content"))
+        # Some thinking-mode reasoning parsers (vLLM's kimi_k2 with K2.6,
+        # deepseek_v4, ...) place the visible reply in ``reasoning_content`` /
+        # ``reasoning`` while leaving ``content`` empty; Hermes also strips
+        # inline ``<think>`` blocks from content at storage time. Without a
+        # fallback we'd persist empty assistant turns even when the model
+        # emitted a real reply. Mirrors the stirrup_agent fix (#1397).
+        if role == "assistant" and not content.strip():
+            content = _coerce_content_text(item.get("reasoning_content")) or _coerce_content_text(
+                item.get("reasoning")
+            )
         if role == "assistant":
             output_items.append(
                 NeMoGymResponseOutputMessageForTraining(
@@ -159,6 +307,65 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     terminal_backend: str = "local"
     terminal_timeout: int = 60
     system_prompt: Optional[str] = None
+    # --- Phase 0 additions --------------------------------------------------
+    # Each agent's HERMES_HOME (per-run snapshot of memory/skills/sessions).
+    # When set, ``model_post_init`` exports it via both env var (for hermes
+    # subprocesses) and the ContextVar override (for in-process callers).
+    # Defaults to ``None`` so existing benchmarks keep the historic
+    # ``~/.hermes`` fallback behavior.
+    hermes_home: Optional[str] = None
+    # Persistence flags forwarded to ``AIAgent``.  Defaults preserve the
+    # original benchmark behavior (everything off — sessions are stateless).
+    # The new pipeline turns these on when ``hermes_home`` points at a
+    # job-local snapshot.
+    persist_memory: bool = False
+    persist_skills: bool = False
+    persist_session: bool = False
+    save_trajectories: bool = False
+    enable_compression: bool = False
+    # JSONL trace sink.  When set, ``trace_writer.build_callbacks`` is wired
+    # into ``AIAgent`` for every conversation; events land in
+    # ``<trace_dir>/<session_id>.jsonl``.  ``agent_name`` defaults to
+    # ``config.name`` so multi-agent fleets get distinct trace identities.
+    trace_dir: Optional[str] = None
+    agent_name: Optional[str] = None
+    # --- Phase 0.5 additions ------------------------------------------------
+    # Peer-agent map (orchestrator-facing).  Keys are logical agent names,
+    # values are ``{het_group: int, port: int}`` entries.  At runtime, the
+    # bundled ``peer_agents`` Hermes plugin (see
+    # ``hermes_home_template/plugins/peer_agents/``) registers one
+    # ``call_<name>`` tool per entry; URLs are resolved lazily from
+    # ``SLURM_MASTER_NODE_HET_GROUP_N`` env vars so the same overlay JSON
+    # works regardless of which node SLURM picks for each het-group.
+    peer_agents: Optional[Dict[str, Dict[str, Any]]] = None
+    # --- Phase 6 (validation) additions -----------------------------------
+    # Optional model-specific ``chat_template_kwargs`` merged into every
+    # outbound LLM request.  Hermes' default patch sets
+    # ``enable_thinking=True`` (Qwen-family convention); models with
+    # different toggles need a manifest override, e.g. Kimi-K2.6 expects
+    # ``{thinking: false}``.  Keys here win over the patch defaults.
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
+    # Some vLLM builds (e.g. ``vllm-glm51-cu130-ray.sqsh`` used for
+    # Kimi-K2.6) hard-reject ``stream=True`` with a 422.  Hermes' default
+    # conversation loop uses streaming for health-check granularity, but
+    # we expose a manifest knob to disable it via ``agent._disable_streaming``
+    # before ``run_conversation``.  Leave ``False`` for vLLM builds that
+    # accept streaming (better staleness detection); flip to ``True`` for
+    # strict-non-stream backends.
+    disable_streaming: bool = False
+    # Promote ``message.reasoning_content`` into ``message.content`` on
+    # API responses whose ``content`` is empty.  Required for Kimi-K2.6
+    # with ``--reasoning-parser kimi_k2``: K2.6 routes the visible reply
+    # entirely through ``reasoning_content`` (10k+ chars of real answer)
+    # and leaves ``content=""``.  Hermes' default loop interprets that as
+    # a model failure, burns its thinking-prefill + empty-content retry
+    # budgets (~5 retries × 60s each), then writes ``content="(empty)"``
+    # and gives up — even though the answer was right there in
+    # ``reasoning_content``.  Promotion mutates the response object
+    # before Hermes consumes it, so Hermes sees populated content and
+    # runs the normal one-pass flow.  Safe for non-thinking models
+    # (no-op when ``content`` is already populated).
+    promote_reasoning_to_content: bool = False
 
 
 class HermesAgentRunRequest(BaseRunRequest):
@@ -169,6 +376,56 @@ class HermesAgentVerifyResponse(BaseVerifyResponse):
     model_config = ConfigDict(extra="allow")
     turns_used: int = 0
     finished_naturally: bool = False
+
+
+class _TaskMessage(BaseModel):
+    role: str
+    content: str
+
+
+class TaskRequest(BaseModel):
+    """Payload accepted by the ``/task`` adapter endpoint.
+
+    Matches ``nemo_skills.mcp.servers.agent_tool.CallAgentTool._http_call``:
+    ``{"task_id": str, "messages": [{"role": "user", "content": str}, ...]}``.
+    The worker runs one conversation and returns the last assistant text.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    task_id: Optional[str] = None
+    messages: List[_TaskMessage]
+
+
+class TaskResponse(BaseModel):
+    """Reply shape consumed by ``CallAgentTool``.
+
+    ``generation`` is the worker's final assistant text (may be empty).
+    ``error`` is non-empty only on failure; ``CallAgentTool`` propagates
+    it to the orchestrator as a tool error.
+    """
+
+    generation: str = ""
+    error: str = ""
+
+
+def _extract_last_assistant_text(resp: "NeMoGymResponse") -> str:
+    """Return the text of the last assistant message in a NeMoGymResponse.
+
+    Walks the response's output items in order; the last assistant
+    ``output_text`` content wins.  Returns empty string if no assistant
+    message was emitted (matches ``HermesAgent.responses`` padding behavior).
+    """
+    last = ""
+    for item in resp.output or []:
+        if getattr(item, "type", None) != "message":
+            continue
+        if getattr(item, "role", None) != "assistant":
+            continue
+        for chunk in getattr(item, "content", None) or []:
+            text = getattr(chunk, "text", None)
+            if text:
+                last = text
+    return last
 
 
 class HermesAgent(SimpleResponsesAPIAgent):
@@ -183,6 +440,62 @@ class HermesAgent(SimpleResponsesAPIAgent):
         os.environ["TERMINAL_ENV"] = self.config.terminal_backend
         os.environ["TERMINAL_TIMEOUT"] = str(self.config.terminal_timeout)
 
+        # HERMES_HOME isolation.  Setting the env var covers any hermes-agent
+        # subprocess (terminal backends, MCP stdio servers, cron workers).
+        # The ContextVar override additionally scopes get_hermes_home() within
+        # this process — defense in depth so a future multi-agent-in-one-process
+        # mode doesn't silently collide on the global env.
+        if self.config.hermes_home:
+            os.environ["HERMES_HOME"] = self.config.hermes_home
+            try:
+                from hermes_constants import set_hermes_home_override
+
+                set_hermes_home_override(self.config.hermes_home)
+            except ImportError:
+                # hermes-agent not on path (e.g. unit tests using only this
+                # module's helpers) — the env var still routes subprocesses.
+                LOG.debug("hermes_constants not importable; relying on HERMES_HOME env var only")
+
+            # Phase 0.5: merge the pipeline-written overlay JSON.
+            # The ns hermes_agent_rollouts pipeline writes
+            # ``<hermes_home>/hermes_agent_overlay.json`` from its manifest —
+            # carrying agent_name, trace_dir, persistence flags, and the
+            # orchestrator's peer_agents map.  We apply it as field-level
+            # overrides on top of the YAML config so Hydra config_paths and
+            # the manifest can coexist without one having to mirror the other.
+            self._apply_overlay_file(Path(self.config.hermes_home) / "hermes_agent_overlay.json")
+
+    def _apply_overlay_file(self, overlay_path: "Path") -> None:
+        """Merge JSON overlay fields into ``self.config``.
+
+        No-op if the file does not exist (the field was set via the existing
+        Hydra path, or no overlay is in use).  Unknown keys are ignored with
+        a warning to keep the contract additive — adding a new overlay key
+        from the pipeline never breaks an older agent build.
+        """
+        if not overlay_path.is_file():
+            return
+        try:
+            data = json.loads(overlay_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            LOG.warning("hermes_agent: failed to read overlay %s: %s", overlay_path, exc)
+            return
+        if not isinstance(data, dict):
+            LOG.warning("hermes_agent: overlay %s is not a JSON object; ignoring", overlay_path)
+            return
+
+        known = set(HermesAgentConfig.model_fields)
+        for key, value in data.items():
+            if key not in known:
+                LOG.warning("hermes_agent: overlay key %r is not a known field; ignoring", key)
+                continue
+            # Pydantic v2 models forbid attribute assignment unless
+            # ``validate_assignment`` is set; bypass via object.__setattr__ —
+            # safe because the overlay only writes recognised fields and the
+            # values are forwarded verbatim to AIAgent / trace_writer downstream.
+            object.__setattr__(self.config, key, value)
+            LOG.debug("hermes_agent: overlay set config.%s", key)
+
     def _resolve_model_base_url(self) -> str:
         # aiagent builds its own openai client; resolve policy_model url
         model_server_cfg = get_first_server_config_dict(
@@ -191,6 +504,38 @@ class HermesAgent(SimpleResponsesAPIAgent):
         )
         base = self.server_client._build_server_base_url(model_server_cfg)
         return f"{base}/v1"
+
+    def setup_webserver(self) -> FastAPI:
+        """Extend the base server with a ``/task`` adapter for CallAgentTool.
+
+        ``CallAgentTool._http_call`` (nemo_skills.mcp.servers.agent_tool) POSTs
+        ``{"task_id", "messages": [{"role": "user", "content": ...}]}`` to
+        ``{url}/task`` and expects ``{"generation": ..., "error": ...}``.
+        We translate that to the existing ``responses()`` flow and extract the
+        last assistant text — no resources_server seed/verify happens here;
+        the worker is a peer agent, not a self-contained rollout.
+        """
+        app = super().setup_webserver()
+        app.post("/task")(self.task)
+        return app
+
+    def _resolve_session_id(self, request: Request) -> str:
+        """Pick a deterministic session_id for trace files.
+
+        Order of precedence:
+          1. ``request.state.task_id`` (set by ``/task`` from ``CallAgentTool``)
+          2. Freshly minted UUID — guarantees a unique trace file per call.
+
+        The ``isinstance(..., str)`` check is deliberate: ``MagicMock``-backed
+        ``Request`` objects in unit tests resolve every attribute to a
+        ``MagicMock``, which would otherwise pass a naive truthy check and
+        emit unreadable trace filenames.
+        """
+        state = getattr(request, "state", None)
+        task_id = getattr(state, "task_id", None) if state is not None else None
+        if isinstance(task_id, str) and task_id:
+            return task_id
+        return f"sess_{uuid4().hex}"
 
     async def responses(
         self,
@@ -209,45 +554,144 @@ class HermesAgent(SimpleResponsesAPIAgent):
         base_url = self._resolve_model_base_url()
         model_name = str(self.config.model_server.name)
 
+        session_id = self._resolve_session_id(request)
+        agent_name = self.config.agent_name or self.config.name or "hermes_agent"
+
+        # Wire up optional JSONL trace callbacks before constructing AIAgent.
+        # Importing lazily so a missing trace_dir keeps this module importable
+        # in environments that don't ship the trace_writer (unit tests of the
+        # helper functions, schema validators, etc.).
+        agent_kwargs: Dict[str, Any] = {}
+        if self.config.trace_dir:
+            from responses_api_agents.hermes_agent.trace_writer import (
+                build_callbacks,
+                emit_event,
+            )
+
+            agent_kwargs.update(build_callbacks(self.config.trace_dir, agent_name, session_id))
+            emit_event(
+                self.config.trace_dir,
+                agent_name,
+                session_id,
+                "session_start",
+                {
+                    "model": model_name,
+                    "max_turns": self.config.max_turns,
+                    "history_len": len(history),
+                    "user_message_preview": (user_message or "")[:200],
+                },
+            )
+        else:
+            emit_event = None  # type: ignore[assignment]
+
+        # The current NousResearch/hermes-agent AIAgent.__init__ doesn't
+        # accept ``use_streaming``, ``temperature``, ``insert_reasoning``
+        # or ``persist_session`` — those were on a stale fork pin and
+        # have since been dropped.  Streaming defaults to off in the
+        # ``responses()`` path; sampling temperature is set per-request
+        # via _build_api_kwargs / request_overrides rather than at
+        # AIAgent construction; reasoning insertion is automatic when
+        # the model emits ``<think>`` blocks; and the agent's session
+        # persistence is governed by ``skip_memory`` + the agent's own
+        # ``_persist_session`` method rather than a constructor flag.
         agent = AIAgent(
             base_url=base_url,
             api_key="gym",  # pragma: allowlist secret
             model=model_name,
-            use_streaming=False,
-            temperature=self.config.temperature,
-            insert_reasoning=True,
             max_iterations=self.config.max_turns,
             enabled_toolsets=self.config.enabled_toolsets,
             disabled_toolsets=self.config.disabled_toolsets,
             quiet_mode=True,
-            skip_context_files=True,
-            skip_memory=True,
-            persist_session=False,
-            save_trajectories=False,
+            # Persistence flags — defaults preserve original benchmark
+            # behavior; the new pipeline turns these on per agent.
+            skip_context_files=not self.config.persist_memory,
+            skip_memory=not self.config.persist_memory,
+            save_trajectories=self.config.save_trajectories,
+            session_id=session_id,
+            **agent_kwargs,
         )
-        agent.compression_enabled = False
+        # Context compression mutates trajectories non-monotonically; keep it
+        # off unless explicitly enabled — RL training needs faithful traces.
+        agent.compression_enabled = self.config.enable_compression
+        # When the backend rejects streaming (e.g. some vLLM builds 422 on
+        # ``stream=True``), short-circuit Hermes' default-stream code path.
+        # The flag is read inside ``conversation_loop.py`` before each turn.
+        if self.config.disable_streaming:
+            agent._disable_streaming = True
 
         _original_build_api_kwargs = agent._build_api_kwargs
+
+        chat_template_overrides = self.config.chat_template_kwargs or {}
 
         def _patched_build_api_kwargs(api_messages):
             kw = _original_build_api_kwargs(api_messages)
             ctk = kw.setdefault("extra_body", {}).setdefault("chat_template_kwargs", {})
-            ctk.setdefault("enable_thinking", True)
+            # Manifest-supplied keys win — Kimi-K2.6 uses ``thinking`` while
+            # Qwen-family uses ``enable_thinking``, so the default below
+            # only applies when no override was set for that key.
+            for key, value in chat_template_overrides.items():
+                ctk[key] = value
+            # Only default ``enable_thinking=True`` when the manifest hasn't
+            # already disabled thinking by some name.  K2.6's chat template
+            # honours ``thinking``; sending both ``thinking: False`` and
+            # ``enable_thinking: True`` lands as conflicting signals and the
+            # model thinks anyway (pilot 2026-05-26 confirmed reasoning_len
+            # > 8 k chars with content empty despite ``thinking: False``).
+            _thinking_disabled = (
+                chat_template_overrides.get("thinking") is False
+                or chat_template_overrides.get("enable_thinking") is False
+            )
+            if not _thinking_disabled:
+                ctk.setdefault("enable_thinking", True)
             ctk["truncate_history_thinking"] = False
             return kw
 
         agent._build_api_kwargs = _patched_build_api_kwargs
 
-        result = await asyncio.to_thread(
-            agent.run_conversation,
-            user_message,
-            system_message,
-            history,
-        )
+        if self.config.promote_reasoning_to_content:
+            _wrap_api_calls_with_reasoning_promotion(agent)
+
+        try:
+            result = await asyncio.to_thread(
+                agent.run_conversation,
+                user_message,
+                system_message,
+                history,
+            )
+        finally:
+            if emit_event is not None:
+                emit_event(
+                    self.config.trace_dir,
+                    agent_name,
+                    session_id,
+                    "session_end",
+                    {},
+                )
 
         messages = result.get("messages") or []
         # aiagent omits system from returned messages
         n_input = len(history) + 1
+
+        # Opt-in diagnostic for the empty-content investigation.  When
+        # ``HERMES_DEBUG_MESSAGES=1``, log every returned message's shape
+        # (role, content/reasoning lengths, presence of tool_calls, full key
+        # list) to stderr so we can tell whether the model emitted text into
+        # ``content``, ``reasoning_content``, ``reasoning``, or nowhere.
+        if os.environ.get("HERMES_DEBUG_MESSAGES"):
+            for _idx, _m in enumerate(messages):
+                if not isinstance(_m, dict):
+                    continue
+                LOG.warning(
+                    "hermes_msg[%d] role=%s content_len=%d reasoning_len=%d "
+                    "reasoning_content_len=%d tool_calls=%s keys=%s",
+                    _idx,
+                    _m.get("role"),
+                    len(_coerce_content_text(_m.get("content"))),
+                    len(_coerce_content_text(_m.get("reasoning"))),
+                    len(_coerce_content_text(_m.get("reasoning_content"))),
+                    bool(_m.get("tool_calls")),
+                    sorted(_m.keys()),
+                )
 
         output_items = _trajectory_to_output_items(messages, n_input)
 
@@ -346,6 +790,34 @@ class HermesAgent(SimpleResponsesAPIAgent):
             return HermesAgentVerifyResponse.model_validate(
                 verify_json | {"turns_used": turns, "finished_naturally": naturally}
             )
+
+    async def task(self, request: Request, body: TaskRequest) -> TaskResponse:
+        """Peer-to-peer agent endpoint consumed by ``CallAgentTool``.
+
+        Translates a ``{task_id, messages}`` payload into the existing
+        ``responses`` flow.  Does **not** call the resources_server — workers
+        are peer agents whose verification is owned by the orchestrator.
+        Any exception during the underlying conversation is converted into a
+        non-empty ``error`` field so the caller's tool layer can recover.
+        """
+        if body.task_id:
+            # Stash on request.state so ``responses`` can use it as session_id
+            # (trace files key by session, so the same task across agents
+            # remains joinable).
+            request.state.task_id = body.task_id
+
+        create_params = NeMoGymResponseCreateParamsNonStreaming(
+            input=[NeMoGymEasyInputMessage(role=m.role, content=m.content) for m in body.messages],
+        )
+
+        async with self.sem:
+            try:
+                resp = await self.responses(request, create_params)
+            except Exception as exc:  # noqa: BLE001 - surface any failure to caller
+                LOG.exception("HermesAgent.task failed: %s", exc)
+                return TaskResponse(generation="", error=f"{type(exc).__name__}: {exc}")
+
+        return TaskResponse(generation=_extract_last_assistant_text(resp), error="")
 
 
 if __name__ == "__main__":

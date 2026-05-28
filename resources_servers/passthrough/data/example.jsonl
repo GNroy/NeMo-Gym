@@ -1,0 +1,5 @@
+{"responses_create_params": {"input": [{"role": "user", "content": "Say hello."}]}, "verifier_metadata": {}}
+{"responses_create_params": {"input": [{"role": "user", "content": "What is 2+2?"}]}, "verifier_metadata": {"expected_answer": "4"}}
+{"responses_create_params": {"input": [{"role": "user", "content": "Who wrote Hamlet?"}]}, "verifier_metadata": {"expected_answer": "Shakespeare"}}
+{"responses_create_params": {"input": [{"role": "user", "content": "Compute log10(1000)."}]}, "verifier_metadata": {"expected_answer": "3"}}
+{"responses_create_params": {"input": [{"role": "user", "content": "Name one noble gas."}]}, "verifier_metadata": {"expected_answer": "helium"}}

@@ -15,3 +15,27 @@ hermes_agent:
       terminal_backend: local
       terminal_timeout: 60
       system_prompt: null
+      # Phase 0: per-agent HERMES_HOME and persistence.  Defaults preserve
+      # the original benchmark behavior (everything off); ns hermes_agent_rollouts
+      # (Phase 1) overlays these per agent.
+      hermes_home: null
+      persist_memory: false
+      persist_skills: false
+      persist_session: false
+      save_trajectories: false
+      enable_compression: false
+      trace_dir: null
+      agent_name: null
+      # Phase 0.5: orchestrator-facing peer map.  Populated by the
+      # ns hermes_agent_rollouts pipeline via overlay JSON; the bundled
+      # peer_agents Hermes plugin registers a `call_<name>` tool per entry.
+      peer_agents: null
+      # Phase 6 (validation): per-model chat_template_kwargs override
+      # merged into every outbound LLM request.  Use ``{thinking: false}``
+      # for Kimi-K2.6; leaving null keeps the default Qwen-style
+      # ``enable_thinking=True`` behaviour baked into the outbound patch.
+      chat_template_kwargs: null
+      # When the backend rejects ``stream=True`` (some vLLM builds 422),
+      # flip this to True to take the non-streaming code path.  Default
+      # False preserves Hermes' streaming health-check semantics.
+      disable_streaming: false

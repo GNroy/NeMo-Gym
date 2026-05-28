@@ -1,0 +1,4 @@
+name: peer_agents
+version: 1.0.0
+description: "Per-agent peer delegation tools.  Reads `peer_agents:` from the overlay JSON the ns hermes_agent_rollouts pipeline writes to HERMES_HOME, and registers one `call_<name>` tool per peer.  Each tool POSTs to the peer's `/task` HTTP endpoint and returns its `generation`.  Hostnames are resolved lazily from SLURM_MASTER_NODE_HET_GROUP_N env vars, so a single overlay works regardless of which node SLURM assigns to each het-group."
+author: NVIDIA / NeMo-Skills
